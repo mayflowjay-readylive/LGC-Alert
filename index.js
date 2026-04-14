@@ -1,12 +1,23 @@
 import Anthropic from '@anthropic-ai/sdk';
 import cron from 'node-cron';
+import http from 'http';
 import fs from 'fs';
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const DISCORD_WEBHOOK   = process.env.DISCORD_WEBHOOK_URL;
-const CHECK_EVERY_HOURS = process.env.CHECK_INTERVAL_HOURS || '6';
+const CHECK_EVERY_HOURS = parseInt(process.env.CHECK_INTERVAL_HOURS || '6');
 const STATE_FILE        = '/tmp/alert_state.json';
+
+// ─── Health check server (keeps Railway happy) ────────────────────────────────
+
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end('TV Price Monitor running\n');
+}).listen(PORT, () => {
+  console.log(`Health check server listening on port ${PORT}`);
+});
 
 // ─── Model Config ─────────────────────────────────────────────────────────────
 //
@@ -17,8 +28,6 @@ const STATE_FILE        = '/tmp/alert_state.json';
 //   { "name": "LG C4 65\"",  "query": "LG C4 65 tommer OLED65C44LA", "threshold": 9500 },
 //   { "name": "LG C5 65\"",  "query": "LG C5 65 tommer OLED65C54LA", "threshold": 11000 }
 // ]
-//
-// Each entry needs: name (display label), query (what to search for), threshold (DKK)
 
 function loadModels() {
   const raw = process.env.WATCHED_MODELS;
@@ -77,7 +86,6 @@ Only include entries where you actually found a price. Omit models with no resul
     },
   ];
 
-  // Agentic loop — web_search may require multiple turns
   let finalText = null;
   for (let i = 0; i < 10; i++) {
     const response = await client.messages.create({
@@ -124,7 +132,7 @@ Only include entries where you actually found a price. Omit models with no resul
   }
 
   const prices = data.prices || [];
-  console.log(`Found ${prices.length} price(s):`, prices);
+  console.log(`Found ${prices.length} price(s):`, JSON.stringify(prices, null, 2));
 
   let state = {};
   try { state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch {}
@@ -197,7 +205,7 @@ async function sendDiscordAlert(item, threshold) {
   }
 }
 
-// ─── Startup ──────────────────────────────────────────────────────────────────
+// ─── Startup + Scheduler ──────────────────────────────────────────────────────
 
 const models = loadModels();
 console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
@@ -206,7 +214,15 @@ models.forEach(m => console.log(`  ${m.name.padEnd(16)} threshold: ${m.threshold
 console.log(`  Check interval : every ${CHECK_EVERY_HOURS} hours`);
 console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
+// Run immediately on start
 checkPrices().catch(console.error);
 
-const cronExpr = `0 */${CHECK_EVERY_HOURS} * * *`;
-cron.schedule(cronExpr, () => checkPrices().catch(console.error));
+// Schedule — for intervals >24h we use a daily cron and track time manually
+if (CHECK_EVERY_HOURS <= 24) {
+  const cronExpr = `0 */${CHECK_EVERY_HOURS} * * *`;
+  cron.schedule(cronExpr, () => checkPrices().catch(console.error));
+} else {
+  // Fall back to setInterval for multi-day intervals
+  const ms = CHECK_EVERY_HOURS * 60 * 60 * 1000;
+  setInterval(() => checkPrices().catch(console.error), ms);
+}
