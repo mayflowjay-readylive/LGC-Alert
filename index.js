@@ -5,42 +5,81 @@ import fs from 'fs';
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const DISCORD_WEBHOOK   = process.env.DISCORD_WEBHOOK_URL;
-const THRESHOLD_55      = parseInt(process.env.PRICE_THRESHOLD_55 || '7000');
-const THRESHOLD_65      = parseInt(process.env.PRICE_THRESHOLD_65 || '10000');
 const CHECK_EVERY_HOURS = process.env.CHECK_INTERVAL_HOURS || '6';
 const STATE_FILE        = '/tmp/alert_state.json';
+
+// ─── Model Config ─────────────────────────────────────────────────────────────
+//
+// WATCHED_MODELS is a JSON array set via Railway env var, e.g.:
+//
+// [
+//   { "name": "LG C4 55\"",  "query": "LG C4 55 tommer OLED55C44LA", "threshold": 7000 },
+//   { "name": "LG C4 65\"",  "query": "LG C4 65 tommer OLED65C44LA", "threshold": 9500 },
+//   { "name": "LG C5 65\"",  "query": "LG C5 65 tommer OLED65C54LA", "threshold": 11000 }
+// ]
+//
+// Each entry needs: name (display label), query (what to search for), threshold (DKK)
+
+function loadModels() {
+  const raw = process.env.WATCHED_MODELS;
+  if (!raw) {
+    return [
+      { name: 'LG C4 55"', query: 'LG C4 55 tommer OLED55C44LA', threshold: 7000 },
+      { name: 'LG C4 65"', query: 'LG C4 65 tommer OLED65C44LA', threshold: 9500 },
+    ];
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    console.error('Failed to parse WATCHED_MODELS env var — using defaults.', e.message);
+    return [];
+  }
+}
 
 // ─── Price Check ─────────────────────────────────────────────────────────────
 
 async function checkPrices() {
-  console.log(`[${new Date().toISOString()}] Starting price check...`);
+  const models = loadModels();
+  if (models.length === 0) {
+    console.error('No models configured. Set WATCHED_MODELS env var.');
+    return;
+  }
+
+  console.log(`[${new Date().toISOString()}] Checking ${models.length} model(s)...`);
+
+  const modelList = models
+    .map((m, i) => `${i + 1}. ${m.name} — search: "${m.query}"`)
+    .join('\n');
+
+  const responseShape = models
+    .map(m => `  { "model": "${m.name}", "price_dkk": <number>, "retailer": "<string>", "url": "<string>" }`)
+    .join(',\n');
 
   const messages = [
     {
       role: 'user',
-      content: `Search for current prices of the LG C4 OLED TV in Denmark right now.
-Look for both sizes on Danish price comparison sites and retailers:
-- 55" model: OLED55C44LA / LG C4 55 tommer
-- 65" model: OLED65C44LA / LG C4 65 tommer
+      content: `Search for current NEW (in-stock) prices in Denmark for each of these TV models:
 
-Check sites like pricerunner.dk, prisjagt.dk, komplett.dk, elgiganten.dk, power.dk, avxperten.dk, etc.
-Focus on NEW (not used) stock that is actually available to order.
+${modelList}
 
-Respond ONLY with raw JSON (no markdown fences, no explanation):
+Check Danish retailers and price comparison sites: pricerunner.dk, prisjagt.dk, power.dk, elgiganten.dk, avxperten.dk, lbs.dk, and any others you find.
+
+For each model, find the LOWEST current new-stock price available.
+
+Respond ONLY with raw JSON (no markdown, no explanation):
 {
   "prices": [
-    { "size": "55", "price_dkk": 6500, "retailer": "Komplett.dk", "url": "https://..." },
-    { "size": "65", "price_dkk": 9800, "retailer": "Elgiganten.dk", "url": "https://..." }
+${responseShape}
   ]
 }
 
-If a size is not found anywhere, omit it. If nothing is found at all, return { "prices": [] }.`,
+Only include entries where you actually found a price. Omit models with no results.`,
     },
   ];
 
   // Agentic loop — web_search may require multiple turns
   let finalText = null;
-  for (let i = 0; i < 8; i++) {
+  for (let i = 0; i < 10; i++) {
     const response = await client.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 1024,
@@ -48,17 +87,15 @@ If a size is not found anywhere, omit it. If nothing is found at all, return { "
       messages,
     });
 
-    // Accumulate assistant turn
     messages.push({ role: 'assistant', content: response.content });
 
     if (response.stop_reason === 'end_turn') {
       const textBlock = response.content.find(b => b.type === 'text');
-      if (textBlock) { finalText = textBlock.text; }
+      if (textBlock) finalText = textBlock.text;
       break;
     }
 
     if (response.stop_reason === 'tool_use') {
-      // Feed tool results back so the model can continue
       const toolResults = response.content
         .filter(b => b.type === 'tool_use')
         .map(b => ({
@@ -77,7 +114,6 @@ If a size is not found anywhere, omit it. If nothing is found at all, return { "
     return;
   }
 
-  // Parse JSON
   let data;
   try {
     const clean = finalText.replace(/```json|```/g, '').trim();
@@ -90,36 +126,33 @@ If a size is not found anywhere, omit it. If nothing is found at all, return { "
   const prices = data.prices || [];
   console.log(`Found ${prices.length} price(s):`, prices);
 
-  // Load persisted state (tracks lowest alerted price per size+retailer)
   let state = {};
   try { state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch {}
 
-  // Check each price against threshold
   for (const item of prices) {
-    const threshold = item.size === '55' ? THRESHOLD_55 : THRESHOLD_65;
+    const modelConfig = models.find(m => m.name === item.model);
+    if (!modelConfig) {
+      console.warn(`Unknown model in response: ${item.model}`);
+      continue;
+    }
+
+    const { threshold } = modelConfig;
+    const key = `${item.model}_${item.retailer}`.toLowerCase().replace(/\s/g, '_');
 
     if (item.price_dkk <= threshold) {
-      const key = `${item.size}_${item.retailer.toLowerCase().replace(/\s/g, '_')}`;
       const lastAlerted = state[key] ?? Infinity;
-
-      // Only alert if this is a new low (avoids spam on unchanged prices)
       if (item.price_dkk < lastAlerted) {
-        console.log(`🔥 ALERT: ${item.size}" at ${item.price_dkk} kr from ${item.retailer}`);
+        console.log(`🔥 ALERT: ${item.model} at ${item.price_dkk} kr from ${item.retailer}`);
         await sendDiscordAlert(item, threshold);
         state[key] = item.price_dkk;
       } else {
-        console.log(`Skipped (already alerted at ${lastAlerted} kr): ${item.size}" @ ${item.retailer}`);
+        console.log(`Skipped (already alerted at ${lastAlerted} kr): ${item.model} @ ${item.retailer}`);
       }
-    }
-  }
-
-  // Reset state entries if price has risen back above threshold (so future drops re-alert)
-  for (const item of prices) {
-    const threshold = item.size === '55' ? THRESHOLD_55 : THRESHOLD_65;
-    const key = `${item.size}_${item.retailer.toLowerCase().replace(/\s/g, '_')}`;
-    if (item.price_dkk > threshold && state[key] !== undefined) {
-      console.log(`Price rose above threshold for ${item.size}" @ ${item.retailer}, resetting state.`);
-      delete state[key];
+    } else {
+      if (state[key] !== undefined) {
+        console.log(`Price rose above threshold for ${item.model} @ ${item.retailer}, resetting state.`);
+        delete state[key];
+      }
     }
   }
 
@@ -134,11 +167,11 @@ async function sendDiscordAlert(item, threshold) {
   const emoji = saving >= 2000 ? '🚨' : saving >= 1000 ? '🔥' : '💡';
 
   const payload = {
-    username: 'LG C4 Price Monitor',
+    username: 'TV Price Monitor',
     avatar_url: 'https://upload.wikimedia.org/wikipedia/commons/thumb/2/20/LG_symbol.svg/256px-LG_symbol.svg.png',
     embeds: [
       {
-        title: `${emoji} LG C4 ${item.size}" – ${item.price_dkk.toLocaleString('da-DK')} kr.`,
+        title: `${emoji} ${item.model} – ${item.price_dkk.toLocaleString('da-DK')} kr.`,
         description: `Below your threshold of **${threshold.toLocaleString('da-DK')} kr.** by **${saving.toLocaleString('da-DK')} kr.**`,
         color: 0x00c853,
         fields: [
@@ -148,7 +181,7 @@ async function sendDiscordAlert(item, threshold) {
         ],
         ...(item.url ? { url: item.url } : {}),
         timestamp: new Date().toISOString(),
-        footer: { text: 'LG C4 Price Monitor • Denmark' },
+        footer: { text: 'TV Price Monitor • Denmark' },
       },
     ],
   };
@@ -166,14 +199,13 @@ async function sendDiscordAlert(item, threshold) {
 
 // ─── Startup ──────────────────────────────────────────────────────────────────
 
+const models = loadModels();
 console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-console.log('  LG C4 Price Monitor — Starting up');
-console.log(`  55" threshold : ${THRESHOLD_55.toLocaleString('da-DK')} kr.`);
-console.log(`  65" threshold : ${THRESHOLD_65.toLocaleString('da-DK')} kr.`);
-console.log(`  Check interval: every ${CHECK_EVERY_HOURS} hours`);
+console.log('  TV Price Monitor — Starting up');
+models.forEach(m => console.log(`  ${m.name.padEnd(16)} threshold: ${m.threshold.toLocaleString('da-DK')} kr.`));
+console.log(`  Check interval : every ${CHECK_EVERY_HOURS} hours`);
 console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
-// Run immediately on start, then on schedule
 checkPrices().catch(console.error);
 
 const cronExpr = `0 */${CHECK_EVERY_HOURS} * * *`;
