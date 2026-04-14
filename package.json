@@ -1,0 +1,17 @@
+{
+  "name": "lg-price-monitor",
+  "version": "1.0.0",
+  "description": "LG C4 OLED price monitor for Danish retailers — alerts via Discord",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "node-cron": "^3.0.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
